@@ -1,0 +1,249 @@
+using System.Collections;
+using UnityEngine;
+using UnityEngine.InputSystem;
+
+public class SpinningTop : MonoBehaviour
+{
+    // Public variables - can be adjusted in the Unity Inspector
+    public float maxSetDownDistance = 5f; // Max distance to set the top down when placing it.
+    public LayerMask validSurfaceMask;   // Layer mask to determine which surfaces are valid to set down on.
+    public float spinVelocity = 150f;    // Angular velocity for the spinning top.
+    public float tossForce = 3f;         // Force applied when the top is tossed.
+    public float placementDuration = 0.5f; // Duration of the smooth set-down animation.
+    public float minFallTime = 2f;       // Minimum time before center of gravity adjusts fully
+    public float maxFallTime = 5f;       // Maximum time before center of gravity adjusts fully
+    public Vector3 startCenterOfGravity = new Vector3(0, -0.01f, 0); // Initial center of gravity of the top.
+    public Vector3 endCenterOfGravity = new Vector3(0, 0.001f, 0);  // Final center of gravity of the top.
+    public AnimationCurve centerOfGravityCurve; // Curve to control the center of gravity adjustment.
+    public float edgeCheckRadius = 0.2f;     // Radius to check for support when placing the top on edges.
+    public float randomPushForce = 0.2f;      // Reduced random force applied to the top.
+    public float randomPushInterval = 0.5f;   // Time interval for applying random pushes.
+    public float pushDuration = 0.75f;        // duration of a single push.
+
+    // Private variables - used internally
+    private Rigidbody spinningTopRb;        // Rigidbody component of the top.
+    private PlayerInteractions playerInteractions; // Reference to PlayerInteractions script for input.
+    private InputAction useAction;          // Input action for using/placing the top.
+    private bool isSpinning = false;        // Flag to track if the top is spinning.
+    private float nextPushTime;            // Time when the next random push should be applied.
+    private bool isPushing = false;         // Flag to track if a push is in progress
+    private Vector3 pushDirection;          // Direction of the push force.
+    private float pushTimer;                // time since the push started.
+
+
+    private void Start()
+    {
+        // Get the Rigidbody component and handle potential null references.
+        spinningTopRb = GetComponent<Rigidbody>();
+        if (spinningTopRb == null)
+        {
+            Debug.LogError("SpinningTop requires a Rigidbody component.");
+            return; // Early exit to avoid further errors if Rigidbody is missing.
+        }
+
+        // Set initial center of mass and remove damping.
+        spinningTopRb.centerOfMass = startCenterOfGravity;
+        spinningTopRb.linearDamping = 0; // removes drag.
+        spinningTopRb.angularDamping = 0;// removes spin drag.
+
+        // Find and get input action from the PlayerInteractions script.
+        playerInteractions = FindObjectOfType<PlayerInteractions>();
+        if (playerInteractions != null)
+        {
+            useAction = playerInteractions.GetPlayerInput().actions["Use"];
+            useAction.performed += HandleUseAction; // Subscribe to the 'use' action event.
+        }
+    }
+
+
+    // Handles the 'Use' action.
+    private void HandleUseAction(InputAction.CallbackContext context)
+    {
+        // Check if top is picked up, then use it
+        if (playerInteractions != null && playerInteractions.currentlyPickedUpObject == gameObject && playerInteractions.isObjectFullyPickedUp)
+        {
+            Debug.Log("Using SpinningTop...");
+            spinningTopRb.centerOfMass = startCenterOfGravity; // reset center of mass
+            EnablePhysics(); // allows physics to affect the top again.
+
+            RaycastHit hit;
+            // Get the screen center for the raycast to determine where the player is trying to place the object
+            Vector3 raycastOrigin = playerInteractions.mainCamera.ScreenToWorldPoint(new Vector3(Screen.width / 2, Screen.height / 2, playerInteractions.mainCamera.nearClipPlane));
+
+            // Perform a raycast to find a valid surface.
+            bool hitDetected = Physics.Raycast(raycastOrigin, playerInteractions.mainCamera.transform.forward, out hit, maxSetDownDistance, validSurfaceMask);
+
+            // Break the connection now that the top is going to be placed.
+            playerInteractions.BreakConnection();
+            playerInteractions.isObjectFullyPickedUp = false; // unset fully picked up.
+
+            if (hitDetected)
+            {
+                Debug.Log("Raycast hit surface, setting down.");
+                StartCoroutine(SmoothSetDown(hit.point)); // coroutine for a smooth set down
+            }
+            else
+            {
+                Debug.Log("No surface detected, tossing top.");
+                TossTop(); // toss the top.
+                ApplySpin(); // apply spin to the top.
+                StartCoroutine(AdjustCenterOfGravity()); // start the center of gravity adjustment.
+            }
+        }
+    }
+
+
+    // Coroutine for smoothly placing the top at a specified position.
+    private IEnumerator SmoothSetDown(Vector3 targetPosition)
+    {
+        spinningTopRb.isKinematic = true; // disable physics for smooth placement.
+        Vector3 startPosition = transform.position; // Current position of the top
+        Quaternion startRotation = transform.rotation; // Current Rotation of the top
+
+        Vector3 finalPosition = targetPosition + Vector3.up * 0.1f; // add a small offset to place it slightly above the hit location.
+
+
+        Vector3 supportedPosition = CheckEdgeSupport(finalPosition, startPosition);
+        if (supportedPosition != Vector3.zero)
+        {
+            finalPosition = supportedPosition; // if there's a new position, overwrite the current one.
+        }
+
+        float elapsed = 0f;
+        while (elapsed < placementDuration)
+        {
+            elapsed += Time.deltaTime; // increment time.
+            float t = Mathf.SmoothStep(0f, 1f, elapsed / placementDuration); // smooth transition based on time.
+            transform.position = Vector3.Lerp(startPosition, finalPosition, t); // move to new location
+            transform.rotation = startRotation; // prevent rotation during smooth placement.
+            yield return null; // wait until next frame
+        }
+        transform.position = finalPosition; // Set final position and re-enable physics.
+        spinningTopRb.isKinematic = false; // Re-enable physics now that the top is placed.
+        ApplySpin();
+        StartCoroutine(AdjustCenterOfGravity());
+    }
+
+
+    // Check if the given position is supported by a collider within a specific range.
+    private Vector3 CheckEdgeSupport(Vector3 finalPosition, Vector3 startPosition)
+    {
+        // Check if the final position is well supported by the surfaces underneath it
+        Collider[] hitColliders = Physics.OverlapSphere(finalPosition, edgeCheckRadius, validSurfaceMask);
+        if (hitColliders.Length == 0)
+        {
+            // nothing below it, don't use the target position.
+            return Vector3.zero;
+        }
+        else
+        {
+            // get the first hit collider's closest point to the finalPosition and move to it.
+            Vector3 closestPoint = hitColliders[0].ClosestPoint(finalPosition);
+            if (closestPoint == finalPosition)
+            {
+                // if it was already directly in the collider, then return that value.
+                return finalPosition;
+            }
+            else
+            {
+                // otherwise return the closest point to move it onto the collider.
+                return closestPoint;
+            }
+        }
+
+    }
+
+
+    // Applies an impulse force to "toss" the top.
+    private void TossTop()
+    {
+        Vector3 tossDirection = playerInteractions.mainCamera.transform.forward.normalized; // normalized camera direction
+        spinningTopRb.AddForce(tossDirection * tossForce, ForceMode.Impulse); // apply instant force to top.
+        Debug.Log($"Top tossed in direction: {tossDirection}");
+    }
+
+    // Applies initial spin to the top and sets spin flag.
+    private void ApplySpin()
+    {
+        spinningTopRb.angularVelocity = transform.up * spinVelocity;
+        Debug.Log($"Spin Applied: {spinningTopRb.angularVelocity}");
+        isSpinning = true; // Set spinning to true.
+        nextPushTime = Time.time + randomPushInterval; // sets the first push time.
+    }
+
+
+    // Coroutine for adjusting the center of gravity over a specified time.
+    private IEnumerator AdjustCenterOfGravity()
+    {
+        float elapsed = 0f;
+        float currentFallTime = Random.Range(minFallTime, maxFallTime);
+        while (elapsed < currentFallTime)
+        {
+            elapsed += Time.deltaTime; // increment time
+            float normalizedTime = Mathf.Clamp01(elapsed / currentFallTime); // ensure value is between 0 and 1.
+            float curveValue = centerOfGravityCurve.Evaluate(normalizedTime); // get curve value at current position in time.
+
+            // lerp from start position to end position using curve value for effect.
+            spinningTopRb.centerOfMass = Vector3.Lerp(startCenterOfGravity, endCenterOfGravity, curveValue);
+            yield return null; // wait until next frame.
+        }
+        spinningTopRb.centerOfMass = endCenterOfGravity; // set center of mass to the final point.
+        Debug.Log("Center of Gravity transition complete.");
+        isSpinning = false; // the transition has finished.
+    }
+
+
+    // FixedUpdate for physics calculations.
+    private void FixedUpdate()
+    {
+        if (isSpinning && spinningTopRb.angularVelocity.magnitude > 0.1f)
+        {
+            // keep the top spinning at constant velocity
+            spinningTopRb.angularVelocity = transform.up * spinVelocity;
+            if (Time.time >= nextPushTime)
+            {
+                ApplyRandomPush();
+                nextPushTime = Time.time + randomPushInterval; // calculate next push time
+            }
+
+            if (isPushing)
+            {
+                pushTimer += Time.fixedDeltaTime; // increment the push timer.
+                float t = Mathf.Clamp01(pushTimer / pushDuration); // Get value between 0-1
+                float currentPushForce = Mathf.Lerp(0, randomPushForce, t); // apply smoothing to push force.
+                spinningTopRb.AddForce(pushDirection * currentPushForce, ForceMode.Force); // apply force over time.
+
+
+                if (t >= 1f)
+                {
+                    isPushing = false; // push is over
+                }
+            }
+        }
+    }
+
+
+    // Applies a random force to slightly displace the top.
+    private void ApplyRandomPush()
+    {
+        // create a random horizontal direction
+        Vector2 randomDirection2D = Random.insideUnitCircle; // get a point inside a circle
+        pushDirection = new Vector3(randomDirection2D.x, 0, randomDirection2D.y).normalized; // convert to normalized vector3
+        pushTimer = 0; // reset push timer
+        isPushing = true; // start a new push.
+    }
+
+
+    // Enables physics simulation for the Rigidbody.
+    private void EnablePhysics()
+    {
+        spinningTopRb.isKinematic = false;
+    }
+
+    // Unsubscribes from the use action event to prevent errors on disable.
+    private void OnDisable()
+    {
+        if (useAction != null)
+            useAction.performed -= HandleUseAction;
+    }
+}
